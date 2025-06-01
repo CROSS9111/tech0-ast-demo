@@ -1,0 +1,418 @@
+from pathlib import Path
+from datetime import date
+import datetime
+import sqlite3
+
+import streamlit as st
+import pandas as pd
+
+# ─────────────────────────────
+# 1. DB 接続ユーティリティ（パスを統一）
+# ─────────────────────────────
+DB = "app.db"  # 同一ディレクトリにある app.db を想定
+db_path = (Path(__file__).resolve().parent / DB).resolve()
+
+@st.cache_resource
+def get_conn():
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+# ─────────────────────────────
+# 2. 共通関数：全四半期データ読み込み
+# ─────────────────────────────
+def load_securities():
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT security_id, security_code, security_name FROM securities", conn
+    )
+    return df
+
+def load_positions_quarter_table():
+    """
+    positions_quarter テーブル全体を読み込む
+    """
+    conn = get_conn()
+    df = pd.read_sql_query("SELECT * FROM positions_quarter", conn)
+    return df
+
+# ─────────────────────────────
+# 3. 投資パフォーマンス用：前期データのみ読み込み
+# ─────────────────────────────
+def load_prev_positions_quarter(db_file: Path, prev_year: str, prev_quarter: str) -> pd.DataFrame:
+    """
+    前期の positions_quarter テーブルを読み込む。
+    テーブルが空の場合は空の DataFrame を返す。
+    戻り値は index を security_code にした DataFrame。
+    """
+    q = """
+        SELECT
+            security_code,
+            security_name,
+            holding_qty   AS prev_holding_qty,
+            avg_cost      AS prev_avg_cost
+        FROM positions_quarter
+        WHERE year = ? AND quarter = ?
+    """
+    with sqlite3.connect(db_file) as conn:
+        df = pd.read_sql_query(q, conn, params=(prev_year, prev_quarter))
+    if df.empty:
+        cols = ["security_name", "prev_holding_qty", "prev_avg_cost"]
+        return pd.DataFrame(columns=cols, index=pd.Index([], name="security_code"))
+    return df.set_index("security_code")
+
+# ─────────────────────────────
+# 4. 投資パフォーマンス用：当期取引読み込み
+# ─────────────────────────────
+def load_transactions_period(db_file: Path, start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    当期四半期の取引 transactions を取得する。
+    期間内に取引がない場合は空の DataFrame を返す。
+    """
+    q = """
+        SELECT
+            t.txn_type, t.quantity, t.price, DATE(t.txn_date) AS txn_date,
+            s.security_code, s.security_name
+        FROM transactions t
+        JOIN securities s ON t.security_id = s.security_id
+        WHERE DATE(t.txn_date) BETWEEN DATE(?) AND DATE(?)
+        ORDER BY DATE(t.txn_date)
+    """
+    with sqlite3.connect(db_file) as conn:
+        df = pd.read_sql_query(q, conn, params=(start_date.isoformat(), end_date.isoformat()))
+    if df.empty:
+        cols = ["txn_type", "quantity", "price", "txn_date", "security_code", "security_name"]
+        return pd.DataFrame(columns=cols)
+    df["txn_date"] = pd.to_datetime(df["txn_date"]).dt.date
+    return df
+
+# ─────────────────────────────
+# 5. 投資パフォーマンス用：最新株価取得
+# ─────────────────────────────
+def load_current_prices(db_file: Path, quote_date: date) -> dict[str, float]:
+    """
+    price_quotes テーブルから「指定日」の終値を取得し、
+    { '7203': 3075.5, ... } の辞書を返す。
+    """
+    query = """
+        SELECT s.security_code, pq.close_price
+        FROM price_quotes pq
+        JOIN securities s ON pq.security_id = s.security_id
+        WHERE pq.quote_date = ?
+    """
+    with sqlite3.connect(db_file) as conn:
+        df = pd.read_sql_query(query, conn, params=(quote_date.isoformat(),))
+    return dict(zip(df["security_code"], df["close_price"]))
+
+# ─────────────────────────────
+# 6. 投資パフォーマンス用：四半期判定ユーティリティ
+# ─────────────────────────────
+def determine_quarter_periods(today: date):
+    """
+    today の年月日から
+    - prev_year (文字列)
+    - prev_quarter (例: 'Q1','Q2','Q3','Q4')
+    - current_start: 当期四半期の開始日 (date)
+    - current_end: today (date)
+    を返却する。
+    """
+    year, month = today.year, today.month
+    if month <= 3:       # 1〜3月 → Q1
+        prev_year, prev_quarter = year - 1, "Q4"
+        current_start = date(year, 1, 1)
+    elif month <= 6:     # 4〜6月 → Q2
+        prev_year, prev_quarter = year, "Q1"
+        current_start = date(year, 4, 1)
+    elif month <= 9:     # 7〜9月 → Q3
+        prev_year, prev_quarter = year, "Q2"
+        current_start = date(year, 7, 1)
+    else:                # 10〜12月 → Q4
+        prev_year, prev_quarter = year, "Q3"
+        current_start = date(year, 10, 1)
+
+    return str(prev_year), prev_quarter, current_start, today
+
+# ─────────────────────────────
+# 7. Streamlit ページ設定
+# ─────────────────────────────
+st.set_page_config(
+    page_title="四半期管理 & 投資パフォーマンス",
+    layout="wide"
+)
+
+# ─────────────────────────────
+# ── ★「今日」と「前期・当期」を最上部に表示する
+# ─────────────────────────────
+today = date.today()
+st.write(f"**今日:** {today:%Y-%m-%d}")
+
+prev_year, prev_quarter, current_start, current_end = determine_quarter_periods(today)
+st.write(f"**前期:** {prev_year} {prev_quarter}　|　**当期:** {current_start:%Y-%m-%d} 〜 {current_end:%Y-%m-%d}")
+
+# ─────────────────────────────
+# 8. 「四半期集計マスタ編集」セクション
+# ─────────────────────────────
+st.header("🗓️ 投資パフォーマンス 四半期集計")
+
+# (A) 証券一覧を読み込み、コードリストを作成
+df_securities = load_securities()
+codes = df_securities["security_code"].tolist()
+
+# (B) positions_quarter テーブル全体を取得し、前期・下落率を計算して表示
+df_latest = load_positions_quarter_table()
+
+if df_latest.empty:
+    st.info("まだデータがありません。")
+else:
+    # 年・四半期でソート
+    df_latest = df_latest.sort_values(["security_code", "year", "quarter"])
+    df_latest["year"] = df_latest["year"].astype(str)
+
+    # ─────────────────────────────
+    # (A-1) 前期の年・四半期を計算
+    # ─────────────────────────────
+    def get_prev_quarter(row):
+        y = int(row["year"])
+        q = row["quarter"]
+        if q == "Q1":
+            return y - 1, "Q4"
+        elif q == "Q2":
+            return y, "Q1"
+        elif q == "Q3":
+            return y, "Q2"
+        else:  # Q4
+            return y, "Q3"
+
+    prev_periods = df_latest.apply(get_prev_quarter, axis=1)
+    df_latest["prev_year_val"] = [y for y, _ in prev_periods]
+    df_latest["prev_quarter_val"] = [q for _, q in prev_periods]
+    df_latest["prev_year_val"] = df_latest["prev_year_val"].astype(str)
+
+    # ─────────────────────────────
+    # (A-2) 前期の market_price をマージして price_drop_rate を計算
+    # ─────────────────────────────
+    temp = df_latest[["security_code", "year", "quarter", "market_price"]].rename(
+        columns={
+            "year": "prev_year_val",
+            "quarter": "prev_quarter_val",
+            "market_price": "prev_market_price"
+        }
+    )
+    df_latest = pd.merge(
+        df_latest,
+        temp,
+        how="left",
+        left_on=["security_code", "prev_year_val", "prev_quarter_val"],
+        right_on=["security_code", "prev_year_val", "prev_quarter_val"]
+    )
+    df_latest["price_drop_rate"] = (
+        (df_latest["market_price"] - df_latest["prev_market_price"])
+        / df_latest["prev_market_price"]
+    )
+
+    # ─────────────────────────────
+    # (A-3) 今期の drop_30pct / drop_50pct を計算
+    # ─────────────────────────────
+    df_latest["drop_30pct"] = df_latest["price_drop_rate"] <= -0.3
+    df_latest["drop_50pct"] = df_latest["price_drop_rate"] <= -0.5
+
+    # ─────────────────────────────
+    # (A-4) 前期の drop_30pct をマージ
+    # ─────────────────────────────
+    prev_flags = df_latest[["security_code", "year", "quarter", "drop_30pct"]].rename(
+        columns={
+            "year": "prev_year_val",
+            "quarter": "prev_quarter_val",
+            "drop_30pct": "prev_drop_30pct"
+        }
+    )
+    df_latest = pd.merge(
+        df_latest,
+        prev_flags,
+        how="left",
+        left_on=["security_code", "prev_year_val", "prev_quarter_val"],
+        right_on=["security_code", "prev_year_val", "prev_quarter_val"]
+    )
+
+    # ─────────────────────────────
+    # (A-5) 判定結果を表示
+    # ─────────────────────────────
+    st.subheader("30%／50% 下落判定結果プレビュー")
+    st.dataframe(
+        df_latest[
+            [
+                "security_code", "security_name",
+                "year", "quarter",
+                "market_price", "prev_market_price",
+                "price_drop_rate", "drop_30pct", "drop_50pct"
+            ]
+        ].sort_values(["security_code", "year", "quarter"]),
+        use_container_width=True
+    )
+
+    conn = get_conn()
+
+    # ─────────────────────────────
+    # (A-7) 30%・50%下落または連続下落銘柄を表示（理由付き）
+    # ─────────────────────────────
+    df_drop = df_latest[
+        (df_latest["drop_50pct"]) |
+        ((df_latest["drop_30pct"]) & (df_latest["prev_drop_30pct"] == True))
+    ].copy()
+
+    def get_reason(row):
+        if row["drop_50pct"]:
+            return "50％下落"
+        if row["drop_30pct"] and row.get("prev_drop_30pct", False):
+            return "連続下落"
+        return ""
+
+    df_drop["下落理由"] = df_drop.apply(get_reason, axis=1)
+
+    st.markdown("#### 前期で30％連続下落または50％下落した銘柄一覧")
+    st.dataframe(
+        df_drop[
+            [
+                "security_code", "security_name",
+                "year", "quarter",
+                "market_price", "prev_market_price",
+                "price_drop_rate", "下落理由"
+            ]
+        ].sort_values(["security_code", "year", "quarter"]),
+        use_container_width=True
+    )
+
+    # ─────────────────────────────
+    # (A-8) CSV ダウンロード
+    # ─────────────────────────────
+    csv_data = df_drop[
+        [
+            "security_code", "security_name",
+            "year", "quarter",
+            "market_price", "prev_market_price",
+            "price_drop_rate", "下落理由"
+        ]
+    ].sort_values(["security_code", "year", "quarter"]).to_csv(index=False).encode("utf-8-sig")
+
+    st.download_button(
+        label="📥 前期で30％連続下落または50％下落した銘柄一覧をCSVダウンロード",
+        data=csv_data,
+        file_name=f"drop_report_{date.today().isoformat()}.csv",
+        mime="text/csv"
+    )
+
+# ─────────────────────────────
+# 9. 画面区切り
+# ─────────────────────────────
+st.markdown("---")
+
+# ─────────────────────────────
+# 10. 「投資パフォーマンス」セクション
+# ─────────────────────────────
+
+# (B) データ取得：前期 positions_quarter と 当期 transactions
+df_prev = load_prev_positions_quarter(db_path, prev_year, prev_quarter)
+df_txn  = load_transactions_period(db_path, current_start, current_end)
+
+prev_codes    = set(df_prev.index)
+current_codes = set(df_txn["security_code"].unique())
+all_codes     = sorted(prev_codes.union(current_codes))
+
+# 最新株価を取得
+price_map = load_current_prices(db_path, today)
+
+if df_prev.empty:
+    st.info("前期 positions_quarter にデータが無いため、前期はゼロとして計算します。")
+if df_txn.empty:
+    st.info("当期はまだ取引がありません。")
+if not price_map:
+    st.warning("price_quotes テーブルに今日のデータがありません。最新株価を登録してください。")
+
+# (C) 指標計算
+results = []
+for code in all_codes:
+    # 銘柄名
+    if code in df_prev.index:
+        sec_name = df_prev.loc[code, "security_name"]
+    else:
+        sec_name = df_txn.loc[df_txn["security_code"] == code, "security_name"].iloc[0]
+
+    # --- 前期 ---
+    prev_qty       = df_prev.loc[code, "prev_holding_qty"] if code in prev_codes else 0.0
+    prev_avg_cost  = df_prev.loc[code, "prev_avg_cost"]    if code in prev_codes else 0.0
+    prev_cost_basis = prev_qty * prev_avg_cost
+
+    # --- 当期取引を反映 ---
+    df_sec = df_txn[df_txn["security_code"] == code]
+    qty, cost_basis = prev_qty, prev_cost_basis
+    for _, row in df_sec.iterrows():
+        if row["txn_type"] == "BUY":
+            cost_basis += row["quantity"] * row["price"]
+            qty        += row["quantity"]
+        elif row["txn_type"] == "SEL":
+            avg_cost_before = cost_basis / qty if qty else 0
+            cost_basis -= row["quantity"] * avg_cost_before
+            qty        -= row["quantity"]
+
+    latest_qty      = qty
+    latest_avg_cost = cost_basis / qty if qty else 0.0
+
+    # --- (追加) 最新移動平均を DB から取得 ---
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT moving_average
+            FROM transactions t
+            JOIN securities s ON t.security_id = s.security_id
+            WHERE s.security_code = ?
+              AND moving_average IS NOT NULL
+            ORDER BY DATE(t.txn_date) DESC, t.transaction_id DESC
+            LIMIT 1
+            """,
+            (code,)
+        )
+        row_ma = cur.fetchone()
+        latest_moving_average = row_ma[0] if row_ma else None
+
+    # --- 指標 ---
+    pct_change = (
+        (latest_avg_cost - prev_avg_cost) / prev_avg_cost * 100
+        if prev_avg_cost else None
+    )
+    current_price = price_map.get(code)
+    unrealized_pl = (
+        (current_price - latest_avg_cost) * latest_qty
+        if current_price is not None else None
+    )
+
+    results.append({
+        "security_code":         code,
+        "security_name":         sec_name,
+        "prev_avg_cost":         prev_avg_cost,
+        "latest_avg_cost":       latest_avg_cost,
+        "latest_moving_average": latest_moving_average,
+        "pct_change_%":          pct_change,
+        "latest_holding_qty":    latest_qty,
+        "current_price":         current_price,
+        "unrealized_PL":         unrealized_pl
+    })
+
+df_result = pd.DataFrame(results)
+
+# (D) 画面表示
+st.subheader("投資状況サマリー")
+show_cols = [
+    "security_code", "security_name",
+    "prev_avg_cost", "latest_avg_cost", "latest_moving_average", "pct_change_%",
+    "latest_holding_qty", "current_price", "unrealized_PL"
+]
+st.dataframe(df_result[show_cols], use_container_width=True)
+
+# (E) CSV ダウンロード
+csv = df_result.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    label="📥 CSV でダウンロード",
+    data=csv,
+    file_name="investment_performance.csv",
+    mime="text/csv"
+)
