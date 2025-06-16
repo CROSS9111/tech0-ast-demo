@@ -237,9 +237,16 @@ else:
     # ─────────────────────────────
     # (A-5) 判定結果を表示
     # ─────────────────────────────
+    df_display = df_latest.copy()
+
+    # price_drop_rate をパーセント文字列に
+    df_display["price_drop_rate"] = df_display["price_drop_rate"].map(
+        lambda v: f"{v:.1%}" if pd.notnull(v) else ""
+    )
+
     st.subheader("30%／50% 下落判定結果プレビュー")
     st.dataframe(
-        df_latest[
+        df_display[
             [
                 "security_code", "security_name",
                 "year", "quarter",
@@ -249,6 +256,18 @@ else:
         ].sort_values(["security_code", "year", "quarter"]),
         use_container_width=True
     )
+    # st.subheader("30%／50% 下落判定結果プレビュー")
+    # st.dataframe(
+    #     df_latest[
+    #         [
+    #             "security_code", "security_name",
+    #             "year", "quarter",
+    #             "market_price", "prev_market_price",
+    #             "price_drop_rate", "drop_30pct", "drop_50pct"
+    #         ]
+    #     ].sort_values(["security_code", "year", "quarter"]),
+    #     use_container_width=True
+    # )
 
     conn = get_conn()
 

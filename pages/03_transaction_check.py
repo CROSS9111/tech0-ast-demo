@@ -88,6 +88,8 @@ if sel_code != "すべて":
 
 # フィルタ後のデータを日付降順にソート
 view = df.loc[mask].sort_values("txn_date", ascending=False)
+view = view.reset_index(drop=True)
+view.index = pd.RangeIndex(start=1, stop=len(view)+1, step=1)
 
 # 3-4. テーブル表示
 st.subheader("トランザクション一覧")
