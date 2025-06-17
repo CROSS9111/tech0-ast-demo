@@ -410,7 +410,7 @@ for code in all_codes:
         "prev_avg_cost":         prev_avg_cost,
         "latest_avg_cost":       latest_avg_cost,
         "latest_moving_average": latest_moving_average,
-        "pct_change_%":          pct_change,
+        "pct_change":          pct_change,
         "latest_holding_qty":    latest_qty,
         "current_price":         current_price,
         "unrealized_PL":         unrealized_pl
@@ -419,11 +419,21 @@ for code in all_codes:
 df_result = pd.DataFrame(results)
 
 # (D) 画面表示
-st.subheader("投資状況サマリー")
+st.subheader("保有株一覧")
+
+df_result["pct_change"] = df_result["pct_change"].map(
+    lambda v: f"{v:.1f}%" if pd.notnull(v) else "")
+
 show_cols = [
-    "security_code", "security_name",
-    "prev_avg_cost", "latest_avg_cost", "latest_moving_average", "pct_change_%",
-    "latest_holding_qty", "current_price", "unrealized_PL"
+    "security_code",
+    "security_name",
+    "latest_holding_qty",      # ←ここを先に
+    "prev_avg_cost",
+    "latest_avg_cost",
+    "latest_moving_average",
+    "pct_change",           # ←パーセント表示済み
+    "current_price",
+    "unrealized_PL"
 ]
 st.dataframe(df_result[show_cols], use_container_width=True)
 
